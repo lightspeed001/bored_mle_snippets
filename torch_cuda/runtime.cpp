@@ -1,26 +1,30 @@
-// src/runtime.cpp
+// src/runtime.cpp (allocator)
 namespace pyra {
 
-void init(int device) {
-  // CONFESSION: we are a driver-API-only framework, but the driver needs a
-  // CUDA context, and the cheapest legal way to create the *primary* context
-  // is one runtime call. cudaFree(0) is the documented idiom for "initialize
-  // the runtime and its primary context, harmlessly". After this, the driver
-  // and runtime APIs share that context in this process, forever, peacefully.
-  cudaFree(0);
+namespace {
+constexpr std::size_t kAlign = 256;                 // float4 loads want 16 B; 256 B keeps
+inline std::size_t round256(std::size_t n) {        // us clear of partition-camping jokes
+  return (n + kAlign - 1) & ~std::size_t(kAlign - 1);
+}
+struct FreeLists { std::map<std::size_t, std::vector<CUdeviceptr>> by_size; };
+FreeLists g_free;
+std::size_t g_live = 0;                             // for the "how much VRAM am I?" debug print
+} // namespace
 
-  CU_CHECK(cuInit(0));
-  CUdevice dev; CU_CHECK(cuDeviceGet(&dev, device));
-  CUcontext ctx; CU_CHECK(cuCtxGetCurrent(&ctx));   // the primary context, now current
-  if (!ctx) CU_CHECK(cuDevicePrimaryCtxRetain(&ctx, dev));
+CUdeviceptr alloc(std::size_t nbytes) {
+  nbytes = round256(nbytes ? nbytes : kAlign);
+  auto& bucket = g_free.by_size[nbytes];
+  if (!bucket.empty()) {                            // hit: O(log n) map lookup, no ioctl
+    CUdeviceptr p = bucket.back(); bucket.pop_back(); return p;
+  }
+  CUdeviceptr p = 0;
+  CU_CHECK(cuMemAlloc(&p, nbytes));                 // miss: pay the municipality
+  g_live += nbytes;
+  return p;
+}
 
-  char name[256]; CU_CHECK(cuDeviceGetName(name, sizeof name, dev));
-  int smem_per_block = 0, sms = 0, clock = 0;
-  CU_CHECK(cuDeviceGetAttribute(&smem_per_block, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, dev));
-  CU_CHECK(cuDeviceGetAttribute(&sms,  CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev));
-  CU_CHECK(cuDeviceGetAttribute(&clock, CU_DEVICE_ATTRIBUTE_CLOCK_RATE, dev));
-  std::printf("[pyra] %s | %d SMs | %.0f MHz | %d KiB smem/block opt-in\n",
-              name, sms, clock / 1e3, smem_per_block / 1024);
+void alloc_free(CUdeviceptr p, std::size_t nbytes) {
+  g_free.by_size[round256(nbytes ? nbytes : kAlign)].push_back(p);
 }
 
 } // namespace pyra
