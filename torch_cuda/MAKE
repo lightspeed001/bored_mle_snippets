@@ -1,0 +1,25 @@
+
+
+cmake_minimum_required(VERSION 3.26)
+project(pyra LANGUAGES CXX CUDA)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CUDA_STANDARD 17)
+
+# Fatbin: SASS for the cards we test on, plus PTX so the driver can JIT
+# anything newer. Part 2 spends a whole section on this line.
+set(CMAKE_CUDA_ARCHITECTURES "75;86;90")
+
+add_library(pyra STATIC
+  src/runtime.cpp src/tensor.cpp src/autograd.cpp src/nn.cpp src/optim.cpp
+  src/kernels/elementwise.cu src/kernels/reduce.cu src/kernels/matmul.cu
+  src/kernels/softmax.cu src/kernels/loss.cu src/kernels/optim.cu)
+target_include_directories(pyra PUBLIC include)
+
+# Part 2 section 1 lives inside this flag: it makes ptxas confess
+# register counts, spills and smem usage at build time.
+target_compile_options(pyra PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v -lineinfo>)
+
+# The entire dependency list. Read it again. This is the joke.
+target_link_libraries(pyra PUBLIC  cuda)    # -lcuda: the DRIVER api
+target_link_libraries(pyra PRIVATE nvrtc)  # not used until Part 2; link now, cry later
