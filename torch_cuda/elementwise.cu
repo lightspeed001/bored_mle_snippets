@@ -1,63 +1,26 @@
+// src/kernels/elementwise.cu — v1: the vectorized twin of Part 1's k_add
+extern "C" __global__ void k_add_f4(const float* __restrict__ a,
+                                    const float* __restrict__ b,
+                                    float* __restrict__ out, int64_t n) {
+  // PRECONDITION, non-negotiable: a, b, out are 16-byte aligned. Our caching
+  // allocator rounds every allocation to 256 B, so this holds by construction.
+  // If you ever bolt this framework onto foreign memory (numpy buffers, mmap,
+  // a friend's allocator), check alignment here or eat an alignment fault.
+  const float4* va = (const float4*)a;
+  const float4* vb = (const float4*)b;
+  float4*       vo = (float4*)out;
 
-
-// src/kernels/elementwise.cu
-// NOTE: no pyra headers in here. Device code stays standalone; the host-side
-// launcher lives in kernels.cpp and talks to this through get_function().
-
-#define PYRA_MAX_DIM 4
-
-// Unravel a flat index into up to 4 coordinates, then walk each operand's
-// strides. Broadcasting is just "this operand's stride here is 0", which the
-// host arranged for us with expand_to().
-__device__ __forceinline__ int64_t strided_offset(
-    int64_t idx, const int64_t* strides, int ndim, const int64_t* sizes) {
-  int64_t off = 0;
-  for (int d = ndim - 1; d >= 0; --d) {        // innermost dim first
-    int64_t c = idx % sizes[d];
-    idx      /= sizes[d];
-    off      += c * strides[d];               // stride 0 => broadcast: free
+  const int64_t n4 = n >> 2;                       // whole vectors
+  int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t stride = (int64_t)gridDim.x * blockDim.x;
+  for (; i < n4; i += stride) {
+    float4 x = va[i], y = vb[i], r;                // one LDG.E.128 each
+    r.x = x.x + y.x; r.y = x.y + y.y;
+    r.z = x.z + y.z; r.w = x.w + y.w;              // 4 independent FMAs: ILP
+    vo[i] = r;                                     // one STG.E.128
   }
-  return off;
+  // Tail: n % 4 scalars. At most three. One thread cleans up; spawning a
+  // second kernel for three floats would be a launch overhead joke.
+  if (threadIdx.x == 0 && blockIdx.x == 0)
+    for (int64_t j = n4 << 2; j < n; ++j) out[j] = a[j] + b[j];
 }
-
-// Generic binary elementwise kernel. OP is a macro symbol like PYRA_OP_ADD.
-#define PYRA_BINARY_KERNEL(NAME, EXPR)                                          \
-extern "C" __global__ void k_##NAME(                                            \
-    const float* __restrict__ a, const int64_t* __restrict__ sa,                \
-    const float* __restrict__ b, const int64_t* __restrict__ sb,                \
-    float* __restrict__ out,                                                    \
-    const int64_t* __restrict__ osizes, int ndim, int64_t n) {                  \
-  int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;                   \
-  int64_t stride = (int64_t)gridDim.x * blockDim.x;                             \
-  for (; i < n; i += stride) {                    /* grid-stride: one launch  */\
-    int64_t oa = strided_offset(i, sa, ndim, osizes);  /* config fits any n,  */\
-    int64_t ob = strided_offset(i, sb, ndim, osizes);  /* and Part 2 can tune  */\
-    float x = a[oa], y = b[ob];                    /* occupancy independently */\
-    out[i] = (EXPR);                                                           \
-  }                                                                             \
-}
-
-#define PYRA_OP_ADD (x + y)
-#define PYRA_OP_SUB (x - y)
-#define PYRA_OP_MUL (x * y)
-#define PYRA_OP_DIV (x / y)
-PYRA_BINARY_KERNEL(add, PYRA_OP_ADD)
-PYRA_BINARY_KERNEL(sub, PYRA_OP_SUB)
-PYRA_BINARY_KERNEL(mul, PYRA_OP_MUL)
-PYRA_BINARY_KERNEL(div, PYRA_OP_DIV)
-
-// Unary twin for neg/exp/log/tanh/relu/gelu; gelu uses the tanh
-// approximation because the exact one needs erff() and a therapy session.
-#define PYRA_UNARY_KERNEL(NAME, EXPR)                                           \
-extern "C" __global__ void k_##NAME(                                            \
-    const float* __restrict__ a, float* __restrict__ out, int64_t n) {          \
-  int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;                   \
-  int64_t stride = (int64_t)gridDim.x * blockDim.x;                             \
-  for (; i < n; i += stride) { float x = a[i]; out[i] = (EXPR); }               \
-}
-PYRA_UNARY_KERNEL(neg, -x)
-PYRA_UNARY_KERNEL(exp, expf(x))
-PYRA_UNARY_KERNEL(log, logf(x))
-PYRA_UNARY_KERNEL(tanh, tanhf(x))
-PYRA_UNARY_KERNEL(relu, x > 0.f ? x : 0.f)
-PYRA_UNARY_KERNEL(gelu, 0.5f * x * (1.f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x))))
